@@ -10,9 +10,11 @@ function handleBoardCreated(api) {
 </script>
 
 <template>
+  <div>
     <TheChessboard 
       @board-created="handleBoardCreated"
     />
+  </div>
 </template>
 
 <style scoped>
