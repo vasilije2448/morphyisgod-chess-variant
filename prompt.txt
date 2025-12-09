@@ -1,0 +1,1 @@
+We're making a simple web app for the chess variant described in GAME_SPECIFICATION.md. The app should use vue3-chessboard  TheChessboard component (see VUE3_CHESSBOARD_DOCS.md) and chess.js library. It only needs to support single player game mode where the user controls both the white and the black pieces. Start by implementing only 1.1 of PLAN.md
