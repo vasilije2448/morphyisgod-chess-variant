@@ -1,13 +1,20 @@
 <script setup>
-import { reactive, ref } from 'vue';
+import { reactive, ref, computed } from 'vue';
 import { TheChessboard } from 'vue3-chessboard';
 import 'vue3-chessboard/style.css';
+import { Chess } from 'chess.js';
 
 const boardApi = ref(null);
+
+// chess.js instance – used for "no check" validation during placement
+// and later for the standard chess phase.
+const chess = ref(null);
 
 // UI state for placement
 const selectedPiece = ref('');
 const selectedColor = ref('w');
+const errorMessage = ref('');
+const infoMessage = ref('');
 
 // Simple list of pieces to place
 const pieceOptions = [
@@ -24,29 +31,52 @@ function randomChoice(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
-// Generate random starting squares for the kings
+// Files and ranks helpers
 const files = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
 const whiteRanks = ['1', '2']; // first 2 ranks from White's perspective
 const blackRanks = ['7', '8']; // last 2 ranks from White's perspective
 
-const whiteKingSquare = randomChoice(files) + randomChoice(whiteRanks);
-const blackKingSquare = randomChoice(files) + randomChoice(blackRanks);
+// Random king squares (recomputed on reset)
+const whiteKingSquare = ref('');
+const blackKingSquare = ref('');
 
 // Internal position map used to build FEN.
 // Keys are squares like "e4", values are { color: 'white'|'black', role: 'king'|'queen'|... }.
-const position = reactive({
-  [whiteKingSquare]: { color: 'white', role: 'king' },
-  [blackKingSquare]: { color: 'black', role: 'king' },
+const position = reactive({});
+
+// Track how many placement moves have been made (excluding the initial kings).
+// Sequence: Move 1 = white pawn, Move 2 = black pawn, Move 3 = white piece, Move 4 = black piece, ...
+const placementMoveCount = ref(1);
+
+// Are we still in the placement phase?
+const inPlacementPhase = ref(true);
+
+// Track whose turn it is to place: 'white' or 'black'
+const currentPlacementColor = computed(() =>
+  placementMoveCount.value % 2 === 1 ? 'white' : 'black',
+);
+
+// Convenience: computed description of what is allowed this move
+const currentMoveRequirement = computed(() => {
+  if (!inPlacementPhase.value) {
+    return 'Placement phase finished. Standard chess game has started.';
+  }
+  const colorText = currentPlacementColor.value === 'white' ? 'White' : 'Black';
+  const isPawnMove = placementMoveCount.value % 2 === 1;
+  if (isPawnMove) {
+    return `${colorText} must place a pawn.`;
+  }
+  return `${colorText} must place a piece (non-pawn).`;
 });
 
-// Board configuration for placement phase 1.1
+// Board configuration
+// IMPORTANT: we must not use a completely empty-board FEN because chess.js
+// requires at least one white and one black king. We start with a minimal
+// valid FEN and immediately overwrite it in resetGame() with our random-king position.
 const boardConfig = reactive({
-  // Start from a valid chess position: at least one white and one black king.
-  // The exact squares are randomized; we keep a simple "kings only" FEN as a placeholder.
   fen: '4k3/8/8/8/8/8/8/4K3 w - - 0 1',
   coordinates: true,
   viewOnly: false,
-  // We are not using chess.js move rules yet; we just place pieces.
   movable: {
     free: false,
     color: 'white',
@@ -59,10 +89,9 @@ const boardConfig = reactive({
     enabled: false,
   },
   highlight: {
-    lastMove: false,
-    check: false,
+    lastMove: true,
+    check: true,
   },
-  // Use chessground's internal select callback instead of a Vue @select event
   events: {
     select: handleSquareSelect,
   },
@@ -70,44 +99,378 @@ const boardConfig = reactive({
 
 function handleBoardCreated(api) {
   boardApi.value = api;
-  // Ensure the board position matches our internal map (random kings)
-  const fen = positionToFen(position);
-  boardApi.value.setPosition(fen);
+  resetGame();
 }
 
 /**
- * Handle square selection on the board.
- * For phase 1.1 we simply place the currently selected piece on the clicked square.
- *
- * This is wired via boardConfig.events.select, which receives the square key
- * directly as a string like "e4".
+ * Helpers for rule enforcement
  */
-function handleSquareSelect(square) {
-  if (!boardApi.value) return;
-  if (!selectedPiece.value || !selectedColor.value) return;
-  if (!square || typeof square !== 'string') return;
 
-  // Map our piece codes to chessground/chess.js roles
-  const roleMap = {
-    k: 'king',
-    q: 'queen',
-    r: 'rook',
-    b: 'bishop',
-    n: 'knight',
-    p: 'pawn',
+// Convert square like "e4" to file ('a'..'h') and rank (1..8)
+function parseSquare(sq) {
+  if (!/^[a-h][1-8]$/.test(sq)) return null;
+  return {
+    file: sq[0],
+    rank: parseInt(sq[1], 10),
   };
+}
 
-  const role = roleMap[selectedPiece.value];
-  if (!role) return;
+// Determine light/dark color of a square
+function squareColor(sq) {
+  const parsed = parseSquare(sq);
+  if (!parsed) return null;
+  const fileIndex = parsed.file.charCodeAt(0) - 'a'.charCodeAt(0); // 0..7
+  const rankIndex = parsed.rank - 1; // 0..7
+  // a1 is dark in standard chess: (0 + 0) % 2 === 0 -> dark
+  const sum = fileIndex + rankIndex;
+  return sum % 2 === 0 ? 'dark' : 'light';
+}
 
-  const color = selectedColor.value === 'w' ? 'white' : 'black';
+// Get all squares in the 3x3 "safe zone" around a king square
+function kingSafeZoneSquares(kingSq) {
+  const parsed = parseSquare(kingSq);
+  if (!parsed) return [];
+  const result = [];
+  const fileIndex = parsed.file.charCodeAt(0) - 'a'.charCodeAt(0);
+  const rank = parsed.rank;
+  for (let df = -1; df <= 1; df += 1) {
+    for (let dr = -1; dr <= 1; dr += 1) {
+      const f = fileIndex + df;
+      const r = rank + dr;
+      if (f < 0 || f > 7 || r < 1 || r > 8) continue;
+      const fileChar = String.fromCharCode('a'.charCodeAt(0) + f);
+      result.push(`${fileChar}${r}`);
+    }
+  }
+  return result;
+}
 
-  // Place or overwrite the piece on that square in our position map
-  position[square] = { color, role };
+// Safe zones (recomputed on reset)
+const whiteKingSafeZone = ref([]);
+const blackKingSafeZone = ref([]);
 
-  // Build a FEN string from the current position and push it to the board
-  const fen = positionToFen(position);
-  boardApi.value.setPosition(fen);
+// Check if a square is in the opponent king's safe zone
+function isSafeSquareForColor(square, color) {
+  if (color === 'white') {
+    // White cannot place on black king's safe squares
+    return blackKingSafeZone.value.includes(square);
+  }
+  if (color === 'black') {
+    // Black cannot place on white king's safe squares
+    return whiteKingSafeZone.value.includes(square);
+  }
+  return false;
+}
+
+// Count bishops of a given color on light/dark squares
+function countBishopsBySquareColor(color, squareColorTarget) {
+  return Object.entries(position).filter(([sq, p]) => {
+    if (p.color !== color || p.role !== 'bishop') return false;
+    return squareColor(sq) === squareColorTarget;
+  }).length;
+}
+
+// Count pieces of a given color and role
+function countPieces(color, role) {
+  return Object.values(position).filter(
+    (p) => p.color === color && p.role === role,
+  ).length;
+}
+
+// Count pawns of a given color
+function countPawns(color) {
+  return countPieces(color, 'pawn');
+}
+
+// Maximum piece counts per color (standard chess)
+const maxPiecesPerColor = {
+  pawn: 8,
+  rook: 2,
+  bishop: 2,
+  knight: 2,
+  queen: 1,
+  king: 1, // kings are pre-placed and we don't allow placing more
+};
+
+// Check if the current move type (pawn vs piece) is legal for this placement
+function isMoveTypeLegalForTurn(pieceCode) {
+  const isPawn = pieceCode === 'p';
+  const isPiece = !isPawn;
+
+  const moveNumber = placementMoveCount.value;
+  const isOdd = moveNumber % 2 === 1;
+
+  // Odd moves must be pawn moves, even moves must be piece moves
+  if (isOdd && !isPawn) return false;
+  if (!isOdd && !isPiece) return false;
+  return true;
+}
+
+/**
+ * Compute all legal pawn squares (by rank band only) for a color.
+ * This ignores occupancy and per-file limits.
+ */
+function getLegalPawnSquaresByRankBand(color) {
+  const squares = [];
+  for (const f of files) {
+    for (let r = 1; r <= 8; r += 1) {
+      const sq = `${f}${r}`;
+      const parsed = parseSquare(sq);
+      if (!parsed) continue;
+      if (color === 'white') {
+        if (parsed.rank < 2 || parsed.rank > 5) continue;
+      } else {
+        if (parsed.rank < 4 || parsed.rank > 7) continue;
+      }
+      squares.push(sq);
+    }
+  }
+  return squares;
+}
+
+/**
+ * Compute all currently empty legal pawn squares (respecting rank band only).
+ */
+function getEmptyLegalPawnSquares(color) {
+  return getLegalPawnSquaresByRankBand(color).filter((sq) => !position[sq]);
+}
+
+/**
+ * Compute all squares where a pawn of this color may actually be placed
+ * given the current position, including:
+ * - rank band
+ * - empty square
+ * - per-file "one pawn per file unless no pawnless files with legal squares" rule.
+ */
+function getTrulyLegalPawnSquares(color) {
+  const result = [];
+
+  // Precompute which files already have a pawn of this color
+  const fileHasPawnMap = {};
+  for (const f of files) {
+    fileHasPawnMap[f] = Object.entries(position).some(([sq, p]) => {
+      if (p.color !== color || p.role !== 'pawn') return false;
+      const parsedSq = parseSquare(sq);
+      if (!parsedSq) return false;
+      return parsedSq.file === f;
+    });
+  }
+
+  // Determine if there exists any pawnless file with at least one empty legal square
+  let hasPawnlessFileWithLegalSquare = false;
+  for (const f of files) {
+    if (fileHasPawnMap[f]) continue; // not pawnless
+
+    let hasEmptyLegalOnF = false;
+    for (let r = 1; r <= 8; r += 1) {
+      const sq = `${f}${r}`;
+      const sqParsed = parseSquare(sq);
+      if (!sqParsed) continue;
+
+      if (color === 'white') {
+        if (sqParsed.rank < 2 || sqParsed.rank > 5) continue;
+      } else {
+        if (sqParsed.rank < 4 || sqParsed.rank > 7) continue;
+      }
+
+      if (!position[sq]) {
+        hasEmptyLegalOnF = true;
+        break;
+      }
+    }
+
+    if (hasEmptyLegalOnF) {
+      hasPawnlessFileWithLegalSquare = true;
+      break;
+    }
+  }
+
+  // Now build the list of truly legal squares
+  for (const f of files) {
+    for (let r = 1; r <= 8; r += 1) {
+      const sq = `${f}${r}`;
+      const parsed = parseSquare(sq);
+      if (!parsed) continue;
+
+      // Must be empty
+      if (position[sq]) continue;
+
+      // Must be in rank band
+      if (color === 'white') {
+        if (parsed.rank < 2 || parsed.rank > 5) continue;
+      } else {
+        if (parsed.rank < 4 || parsed.rank > 7) continue;
+      }
+
+      const thisFileHasPawn = fileHasPawnMap[f];
+
+      // If this file has no pawn yet, this square is legal
+      if (!thisFileHasPawn) {
+        result.push(sq);
+        continue;
+      }
+
+      // This file already has a pawn.
+      // We may only place here if there are no pawnless files with legal squares.
+      if (!hasPawnlessFileWithLegalSquare) {
+        result.push(sq);
+      }
+    }
+  }
+
+  return result;
+}
+
+// Check if pawn placement is legal according to rank/file and per-file limits
+function isPawnPlacementLegal(square, color) {
+  const parsed = parseSquare(square);
+  if (!parsed) {
+    return {
+      ok: false,
+      reason: 'Invalid square.',
+    };
+  }
+
+  const { file, rank } = parsed;
+
+  // Rank constraints: pawns must be 3 or more squares away from queening rank
+  // White queening rank is 8 -> allowed ranks 2,3,4,5
+  // Black queening rank is 1 -> allowed ranks 4,5,6,7
+  if (color === 'white') {
+    if (rank < 2 || rank > 5) {
+      const legalSquares = getTrulyLegalPawnSquares(color).join(', ');
+      return {
+        ok: false,
+        reason: `White pawns may only be placed on ranks 2–5. Legal white pawn squares given the current position: ${legalSquares}`,
+      };
+    }
+  } else if (color === 'black') {
+    if (rank < 4 || rank > 7) {
+      const legalSquares = getTrulyLegalPawnSquares(color).join(', ');
+      return {
+        ok: false,
+        reason: `Black pawns may only be placed on ranks 4–7. Legal black pawn squares given the current position: ${legalSquares}`,
+      };
+    }
+  }
+
+  // Global limit: at most 8 pawns per color
+  const totalPawns = countPawns(color);
+  if (totalPawns >= maxPiecesPerColor.pawn) {
+    return {
+      ok: false,
+      reason: `You may not place more than ${maxPiecesPerColor.pawn} pawns for ${color}.`,
+    };
+  }
+
+  // Determine if this file already has a pawn of this color
+  const fileHasPawn = Object.entries(position).some(([sq, p]) => {
+    if (p.color !== color || p.role !== 'pawn') return false;
+    const parsedSq = parseSquare(sq);
+    if (!parsedSq) return false;
+    return parsedSq.file === file;
+  });
+
+  // If this file has no pawn yet, this square is allowed (rank band already checked)
+  if (!fileHasPawn) {
+    return { ok: true };
+  }
+
+  // This file already has a pawn of this color.
+  // We must now check the "no pawnless files with legal squares" condition.
+  //
+  // A "pawnless file with a legal square" means:
+  // - There exists some file F where this color has no pawn yet, AND
+  // - There exists at least one empty square on F in the allowed rank band.
+  let hasPawnlessFileWithLegalSquare = false;
+
+  for (const f of files) {
+    // Does this file already have a pawn of this color?
+    const fileHasPawnOnF = Object.entries(position).some(([sq, p]) => {
+      if (p.color !== color || p.role !== 'pawn') return false;
+      const parsedSq = parseSquare(sq);
+      if (!parsedSq) return false;
+      return parsedSq.file === f;
+    });
+
+    if (fileHasPawnOnF) {
+      continue; // not pawnless
+    }
+
+    // Check if there is at least one empty legal square on this pawnless file
+    let hasEmptyLegalOnF = false;
+    for (let r = 1; r <= 8; r += 1) {
+      const sq = `${f}${r}`;
+      const sqParsed = parseSquare(sq);
+      if (!sqParsed) continue;
+
+      if (color === 'white') {
+        if (sqParsed.rank < 2 || sqParsed.rank > 5) continue;
+      } else {
+        if (sqParsed.rank < 4 || sqParsed.rank > 7) continue;
+      }
+
+      if (!position[sq]) {
+        hasEmptyLegalOnF = true;
+        break;
+      }
+    }
+
+    if (hasEmptyLegalOnF) {
+      hasPawnlessFileWithLegalSquare = true;
+      break;
+    }
+  }
+
+  if (!hasPawnlessFileWithLegalSquare) {
+    // No pawnless file has any legal empty square -> we are allowed to stack
+    return { ok: true };
+  }
+
+  // Otherwise, we must reject and show the currently available pawn squares
+  const emptyLegalSquares = getTrulyLegalPawnSquares(color);
+  const legalSquaresList = emptyLegalSquares.join(', ');
+
+  return {
+    ok: false,
+    reason:
+      `You may only have one pawn per file unless there are no pawnless files with legal pawn squares for this color. ` +
+      `Currently available pawn squares for ${color}: ${legalSquaresList}`,
+  };
+}
+
+// Check if bishop placement is legal (one light-squared and one dark-squared bishop per color)
+function isBishopPlacementLegal(square, color) {
+  const sqColor = squareColor(square);
+  if (!sqColor) {
+    return { ok: false, reason: 'Invalid square.' };
+  }
+
+  const existingCount = countBishopsBySquareColor(color, sqColor);
+  if (existingCount >= 1) {
+    return {
+      ok: false,
+      reason: `You may only have one ${sqColor}-squared bishop for ${color}.`,
+    };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Enforce per-piece maximum counts (rooks, knights, bishops, queens, pawns).
+ */
+function isPieceCountLegal(role, color) {
+  const max = maxPiecesPerColor[role];
+  if (max == null) return true;
+  const current = countPieces(color, role);
+  if (current >= max) {
+    return {
+      ok: false,
+      reason: `You may not place more than ${max} ${role}${max > 1 ? 's' : ''} for ${color}.`,
+    };
+  }
+  return { ok: true };
 }
 
 /**
@@ -197,6 +560,257 @@ function positionToFen(pos) {
   // Full FEN: piece placement + simple defaults
   return `${ranks.join('/')}` + ' w - - 0 1';
 }
+
+/**
+ * Check if placing a piece on a square would put the opponent in check.
+ * Uses chess.js for move generation and check detection.
+ *
+ * Note: chess.js v1.4.0 uses inCheck(), not in_check().
+ */
+function wouldPlacePutOpponentInCheck(square, color, role) {
+  const fen = positionToFen(position);
+  const tempChess = new Chess(fen);
+
+  // Determine piece letter for FEN
+  const base = {
+    king: 'k',
+    queen: 'q',
+    rook: 'r',
+    bishop: 'b',
+    knight: 'n',
+    pawn: 'p',
+  }[role];
+  if (!base) return false;
+
+  const sqParsed = parseSquare(square);
+  if (!sqParsed) return false;
+
+  // Build a new FEN by adding/overwriting this piece on the target square.
+  // We'll do this by using chess.js's board() representation.
+  const boardArr = tempChess.board();
+  const fileIndex = square.charCodeAt(0) - 'a'.charCodeAt(0);
+  const rankFromBottom = sqParsed.rank - 1;
+  const rankIndex = 7 - rankFromBottom;
+
+  boardArr[rankIndex][fileIndex] = {
+    type: base,
+    color: color === 'white' ? 'w' : 'b',
+  };
+
+  // Rebuild FEN piece placement from modified board
+  let fenPlacement = '';
+  for (let r = 0; r < 8; r += 1) {
+    let empty = 0;
+    for (let f = 0; f < 8; f += 1) {
+      const cell = boardArr[r][f];
+      if (!cell) {
+        empty += 1;
+      } else {
+        if (empty > 0) {
+          fenPlacement += String(empty);
+          empty = 0;
+        }
+        const sym = cell.type;
+        fenPlacement += cell.color === 'w' ? sym.toUpperCase() : sym;
+      }
+    }
+    if (empty > 0) fenPlacement += String(empty);
+    if (r < 7) fenPlacement += '/';
+  }
+
+  // Side to move should be the opponent; we want to know if they are in check.
+  const sideToMove = color === 'white' ? 'b' : 'w';
+  const newFen = `${fenPlacement} ${sideToMove} - - 0 1`;
+  const finalChess = new Chess(newFen);
+
+  // inCheck() answers "is side to move in check?"
+  if (typeof finalChess.inCheck === 'function') {
+    return finalChess.inCheck();
+  }
+
+  // Fallback: if API is different, do not block placement
+  return false;
+}
+
+/**
+ * Handle square selection on the board during placement.
+ */
+function handleSquareSelect(square) {
+  if (!inPlacementPhase.value) {
+    // In the standard chess phase, moves would be handled differently.
+    return;
+  }
+
+  errorMessage.value = '';
+  infoMessage.value = '';
+
+  if (!boardApi.value) return;
+  if (!selectedPiece.value) {
+    errorMessage.value = 'Please select a piece first.';
+    return;
+  }
+  if (!square || typeof square !== 'string') return;
+
+  // Enforce alternating colors: ignore selectedColor and derive from move number
+  const expectedColor = currentPlacementColor.value; // 'white' or 'black'
+  const expectedColorCode = expectedColor === 'white' ? 'w' : 'b';
+
+  // If user-selected color doesn't match, override it to avoid confusion
+  selectedColor.value = expectedColorCode;
+
+  // Do not allow placing on an occupied square
+  if (position[square]) {
+    errorMessage.value = `Square ${square} is already occupied. Please choose an empty square.`;
+    return;
+  }
+
+  // Map our piece codes to chessground/chess.js roles
+  const roleMap = {
+    k: 'king',
+    q: 'queen',
+    r: 'rook',
+    b: 'bishop',
+    n: 'knight',
+    p: 'pawn',
+  };
+
+  const role = roleMap[selectedPiece.value];
+  if (!role) return;
+
+  const color = expectedColor;
+
+  // Enforce move type (pawn vs piece) alternation
+  if (!isMoveTypeLegalForTurn(selectedPiece.value)) {
+    const isPawnMove = placementMoveCount.value % 2 === 1;
+    errorMessage.value = isPawnMove
+      ? 'This move must be a pawn placement.'
+      : 'This move must be a piece (non-pawn) placement.';
+    return;
+  }
+
+  // Enforce per-piece maximum counts (except kings, which are pre-placed)
+  if (role !== 'king') {
+    const pieceCountCheck = isPieceCountLegal(role, color);
+    if (!pieceCountCheck.ok) {
+      errorMessage.value = pieceCountCheck.reason;
+      return;
+    }
+  }
+
+  // Prevent placing on opponent king's safe squares
+  if (isSafeSquareForColor(square, color)) {
+    errorMessage.value =
+      'You may not place a piece on the 3×3 safe zone around the opponent king.';
+    return;
+  }
+
+  // Enforce pawn-specific rules
+  if (role === 'pawn') {
+    const pawnCheck = isPawnPlacementLegal(square, color);
+    if (!pawnCheck.ok) {
+      errorMessage.value = pawnCheck.reason;
+      return;
+    }
+  }
+
+  // Enforce bishop-specific rules
+  if (role === 'bishop') {
+    const bishopCheck = isBishopPlacementLegal(square, color);
+    if (!bishopCheck.ok) {
+      errorMessage.value = bishopCheck.reason;
+      return;
+    }
+  }
+
+  // Enforce "You may NOT place your opponent in check."
+  if (wouldPlacePutOpponentInCheck(square, color, role)) {
+    errorMessage.value = 'You may not place a piece that puts the opponent in check.';
+    return;
+  }
+
+  // Place the piece on that square in our position map (no overwriting allowed now)
+  position[square] = { color, role };
+
+  // Build a FEN string from the current position and push it to the board
+  const fen = positionToFen(position);
+  boardApi.value.setPosition(fen);
+
+  // Advance placement move counter
+  placementMoveCount.value += 1;
+}
+
+/**
+ * Reset the entire game back to the start of the placement phase.
+ * This must create an "empty board except for the two kings randomly placed
+ * on the first two / last two ranks", per GAME_SPECIFICATION.md.
+ */
+function resetGame() {
+  // Clear state
+  Object.keys(position).forEach((key) => {
+    delete position[key];
+  });
+
+  // Randomize kings on the correct rank ranges
+  whiteKingSquare.value = randomChoice(files) + randomChoice(whiteRanks);
+  blackKingSquare.value = randomChoice(files) + randomChoice(blackRanks);
+
+  // Place only the two kings on the otherwise empty board
+  position[whiteKingSquare.value] = { color: 'white', role: 'king' };
+  position[blackKingSquare.value] = { color: 'black', role: 'king' };
+
+  whiteKingSafeZone.value = kingSafeZoneSquares(whiteKingSquare.value);
+  blackKingSafeZone.value = kingSafeZoneSquares(blackKingSquare.value);
+
+  placementMoveCount.value = 1;
+  inPlacementPhase.value = true;
+  selectedPiece.value = '';
+  selectedColor.value = 'w';
+  errorMessage.value = '';
+  infoMessage.value =
+    'Placement phase: White starts by placing a pawn, then Black places a pawn, then White places a piece, then Black places a piece, and so on.';
+
+  const fen = positionToFen(position);
+  boardConfig.fen = fen;
+  boardConfig.viewOnly = false;
+  boardConfig.movable.free = false;
+  boardConfig.movable.color = 'white';
+  boardConfig.events.select = handleSquareSelect;
+
+  if (boardApi.value) {
+    boardApi.value.setPosition(fen);
+  }
+
+  // Reset chess.js to this starting placement position
+  chess.value = new Chess(fen);
+}
+
+/**
+ * Start the standard chess game after placement is done.
+ * This locks further placement and hands control to chess.js + chessground.
+ */
+function startChessGame() {
+  if (!inPlacementPhase.value) {
+    return;
+  }
+
+  const fen = positionToFen(position);
+  chess.value = new Chess(fen);
+
+  inPlacementPhase.value = false;
+  errorMessage.value = '';
+  infoMessage.value = 'Standard chess game started. White to move.';
+
+  // For now we just freeze placement; full move integration can be added later.
+  boardConfig.fen = fen;
+  boardConfig.viewOnly = false;
+  boardConfig.movable.free = true;
+  boardConfig.movable.color = 'white';
+  boardConfig.events.select = undefined;
+
+  if (boardApi.value) {
+    boardApi.value.setPosition(fen);
+  }
+}
 </script>
 
 <template>
@@ -204,19 +818,34 @@ function positionToFen(pos) {
     <header class="app-header">
       <h1>Custom Chess Variant – Placement Phase</h1>
       <p class="app-subtitle">
-        Step 1.1: Click a piece and color above, then click a square on the
-        board to place it. No rules are enforced yet.
+        Step 1.2: Place pieces according to the variant rules. Kings are
+        pre-placed; safe zones, pawn limits, bishop limits, per-piece limits,
+        alternating colors, and "no check" placement are enforced.
       </p>
     </header>
 
     <main class="app-main">
       <section class="controls">
+        <div class="controls-row controls-row-buttons">
+          <button type="button" class="primary-button" @click="resetGame">
+            Reset game
+          </button>
+          <button
+            type="button"
+            class="secondary-button"
+            @click="startChessGame"
+          >
+            Start chess game
+          </button>
+        </div>
+
         <div class="controls-row">
           <label class="control-label" for="piece-select">Piece:</label>
           <select
             id="piece-select"
             v-model="selectedPiece"
             class="control-select"
+            :disabled="!inPlacementPhase"
           >
             <option disabled value="">-- choose a piece --</option>
             <option
@@ -229,12 +858,14 @@ function positionToFen(pos) {
           </select>
         </div>
 
+        <!-- Color selector is kept for visibility but effectively overridden by turn logic -->
         <div class="controls-row">
-          <label class="control-label" for="color-select">Color:</label>
+          <label class="control-label" for="color-select">Color (info only):</label>
           <select
             id="color-select"
             v-model="selectedColor"
             class="control-select"
+            disabled
           >
             <option value="w">White</option>
             <option value="b">Black</option>
@@ -242,8 +873,17 @@ function positionToFen(pos) {
         </div>
 
         <p class="hint">
-          1. Select a piece and color. 2. Click any square on the board to place
-          that piece. 3. Clicking an occupied square overwrites the piece.
+          {{ currentMoveRequirement }}
+        </p>
+        <p class="hint">
+          1. Select a piece. 2. Click a legal square on the board to place that
+          piece. 3. Illegal placements are rejected with a message below.
+        </p>
+        <p v-if="infoMessage" class="info">
+          {{ infoMessage }}
+        </p>
+        <p v-if="errorMessage" class="error">
+          {{ errorMessage }}
         </p>
       </section>
 
@@ -308,8 +948,12 @@ function positionToFen(pos) {
   gap: 0.5rem;
 }
 
+.controls-row-buttons {
+  justify-content: space-between;
+}
+
 .control-label {
-  flex: 0 0 110px;
+  flex: 0 0 140px;
   font-size: 0.9rem;
 }
 
@@ -319,10 +963,50 @@ function positionToFen(pos) {
   font-size: 0.9rem;
 }
 
+.primary-button,
+.secondary-button {
+  flex: 1;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.9rem;
+  border-radius: 0.4rem;
+  border: none;
+  cursor: pointer;
+}
+
+.primary-button {
+  background-color: #1976d2;
+  color: white;
+}
+
+.primary-button:hover {
+  background-color: #145ca3;
+}
+
+.secondary-button {
+  background-color: #e0e0e0;
+  color: #333;
+}
+
+.secondary-button:hover {
+  background-color: #cfcfcf;
+}
+
 .hint {
-  margin: 0.5rem 0 0;
+  margin: 0.25rem 0 0;
   font-size: 0.8rem;
   color: #666;
+}
+
+.info {
+  margin: 0.25rem 0 0;
+  font-size: 0.8rem;
+  color: #1565c0;
+}
+
+.error {
+  margin: 0.25rem 0 0;
+  font-size: 0.8rem;
+  color: #b00020;
 }
 
 .board-wrapper {
