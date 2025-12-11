@@ -7,7 +7,7 @@ import { Chess } from 'chess.js';
 const boardApi = ref(null);
 
 // chess.js instance – used for "no check" validation during placement
-// and later for the standard chess phase.
+// and later for the standard chess phase (only for validation, not move rules).
 const chess = ref(null);
 
 // UI state for placement
@@ -87,7 +87,7 @@ const currentMoveRequirement = computed(() => {
   return `${colorText} must place a piece (non-pawn).`;
 });
 
-// Board configuration
+// Board configuration for placement phase
 // IMPORTANT: we must not use a completely empty-board FEN because chess.js
 // requires at least one white and one black king. We start with a minimal
 // valid FEN and immediately overwrite it in resetGame() with our random-king position.
@@ -112,6 +112,31 @@ const boardConfig = reactive({
   },
   events: {
     select: handleSquareSelect,
+  },
+});
+
+// Board configuration for standard chess phase
+const standardBoardConfig = reactive({
+  fen: 'start', // will be replaced with placement FEN when starting the game
+  coordinates: true,
+  viewOnly: false,
+  movable: {
+    free: false,
+    color: 'white',
+    showDests: true,
+  },
+  selectable: {
+    enabled: true,
+  },
+  draggable: {
+    enabled: true,
+  },
+  highlight: {
+    lastMove: true,
+    check: true,
+  },
+  events: {
+    // no custom events needed; standard rules are handled by TheChessboard
   },
 });
 
@@ -691,7 +716,7 @@ function wouldPlacePutOpponentInCheck(square, color, role) {
  */
 function handleSquareSelect(square) {
   if (!inPlacementPhase.value) {
-    // In the standard chess phase, moves would be handled differently.
+    // In the standard chess phase, moves are handled by the standard board.
     return;
   }
 
@@ -827,7 +852,6 @@ function resetGame() {
   boardConfig.fen = fen;
   boardConfig.viewOnly = false;
   boardConfig.movable.free = false;
-  boardConfig.movable.color = 'white';
   boardConfig.events.select = handleSquareSelect;
 
   if (boardApi.value) {
@@ -843,7 +867,8 @@ function resetGame() {
 
 /**
  * Start the standard chess game after placement is done.
- * This locks further placement and hands control to chess.js + chessground.
+ * This locks further placement and hands control to vue3-chessboard's
+ * standard chess rules on a separate board instance.
  */
 function startChessGame() {
   if (!inPlacementPhase.value) {
@@ -851,22 +876,20 @@ function startChessGame() {
   }
 
   const fen = positionToFen(position);
+
+  // Initialize chess.js with this FEN (kept for potential future use)
   chess.value = new Chess(fen);
+
+  // Configure the standard chess board to start from the placement FEN
+  standardBoardConfig.fen = fen;
+  standardBoardConfig.viewOnly = false;
 
   inPlacementPhase.value = false;
   errorMessage.value = '';
   infoMessage.value = 'Standard chess game started.';
 
-  // For now we just freeze placement; full move integration can be added later.
-  boardConfig.fen = fen;
-  boardConfig.viewOnly = false;
-  boardConfig.movable.free = true;
-  boardConfig.movable.color = 'white';
-  boardConfig.events.select = undefined;
-
-  if (boardApi.value) {
-    boardApi.value.setPosition(fen);
-  }
+  // The placement board remains mounted but becomes invisible via v-if.
+  // The standard board becomes visible and handles all moves itself.
 }
 
 /**
@@ -889,11 +912,12 @@ watch(
 <template>
   <div class="app">
     <header class="app-header">
-      <h1>Custom Chess Variant – Placement Phase</h1>
+      <h1>Custom Chess Variant – Placement &amp; Play</h1>
       <p class="app-subtitle">
         Step 1.2: Place pieces according to the variant rules. Kings are
         pre-placed; safe zones, pawn limits, bishop limits, per-piece limits,
-        alternating colors, and "no check" placement are enforced.
+        alternating colors, and "no check" placement are enforced. Then play a
+        standard chess game from the resulting position.
       </p>
     </header>
 
@@ -912,7 +936,7 @@ watch(
           </button>
         </div>
 
-        <div class="controls-row">
+        <div class="controls-row" v-if="inPlacementPhase">
           <label class="control-label" for="piece-select">Piece:</label>
           <select
             id="piece-select"
@@ -932,7 +956,7 @@ watch(
         </div>
 
         <!-- Color selector shows whose turn it is; it is driven by the logic, not user choice -->
-        <div class="controls-row">
+        <div class="controls-row" v-if="inPlacementPhase">
           <label class="control-label" for="color-select">Side to place:</label>
           <select
             id="color-select"
@@ -948,15 +972,19 @@ watch(
         <p class="hint">
           {{ currentMoveRequirement }}
         </p>
-        <p class="hint">
+        <p class="hint" v-if="inPlacementPhase">
           A recommended piece is auto-selected for you (Knight → Bishop → Rook
           → Queen on piece moves). You can still change the selection manually
           before clicking a square.
         </p>
-        <p class="hint">
+        <p class="hint" v-if="inPlacementPhase">
           1. Confirm or change the selected piece. 2. Click a legal square on
           the board to place that piece. 3. Illegal placements are rejected
           with a message below.
+        </p>
+        <p class="hint" v-else>
+          Standard chess phase: play normally from the custom starting
+          position. All standard chess rules are enforced by the board.
         </p>
 
         <!-- Reserve vertical space for messages so the board doesn't move -->
@@ -971,10 +999,19 @@ watch(
       </section>
 
       <section class="board-wrapper">
+        <!-- Placement-phase board -->
         <TheChessboard
+          v-if="inPlacementPhase"
           :board-config="boardConfig"
           reactive-config
           @board-created="handleBoardCreated"
+        />
+
+        <!-- Standard chess-phase board -->
+        <TheChessboard
+          v-else
+          :board-config="standardBoardConfig"
+          reactive-config
         />
       </section>
     </main>
