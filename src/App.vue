@@ -958,12 +958,16 @@ watch(
           the board to place that piece. 3. Illegal placements are rejected
           with a message below.
         </p>
-        <p v-if="infoMessage" class="info">
-          {{ infoMessage }}
-        </p>
-        <p v-if="errorMessage" class="error">
-          {{ errorMessage }}
-        </p>
+
+        <!-- Reserve vertical space for messages so the board doesn't move -->
+        <div class="messages">
+          <p v-if="infoMessage" class="info">
+            {{ infoMessage }}
+          </p>
+          <p v-if="errorMessage" class="error">
+            {{ errorMessage }}
+          </p>
+        </div>
       </section>
 
       <section class="board-wrapper">
@@ -1076,14 +1080,23 @@ watch(
   color: #666;
 }
 
+/* Fixed-height container for messages so layout doesn't jump */
+.messages {
+  min-height: 5.4rem; /* enough for a few short lines */
+  margin-top: 0.25rem;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+}
+
 .info {
-  margin: 0.25rem 0 0;
+  margin: 0;
   font-size: 0.8rem;
   color: #1565c0;
 }
 
 .error {
-  margin: 0.25rem 0 0;
+  margin: 0.15rem 0 0;
   font-size: 0.8rem;
   color: #b00020;
 }
