@@ -1,5 +1,5 @@
 <script setup>
-import { reactive, ref, computed } from 'vue';
+import { reactive, ref, computed, watch } from 'vue';
 import { TheChessboard } from 'vue3-chessboard';
 import 'vue3-chessboard/style.css';
 import { Chess } from 'chess.js';
@@ -45,16 +45,35 @@ const blackKingSquare = ref('');
 const position = reactive({});
 
 // Track how many placement moves have been made (excluding the initial kings).
-// Sequence: Move 1 = white pawn, Move 2 = black pawn, Move 3 = white piece, Move 4 = black piece, ...
+// We want the repeating pattern:
+// 1: white pawn
+// 2: black pawn
+// 3: white piece
+// 4: black piece
+// 5: white pawn
+// 6: black pawn
+// 7: white piece
+// 8: black piece
+// ...
 const placementMoveCount = ref(1);
 
 // Are we still in the placement phase?
 const inPlacementPhase = ref(true);
 
 // Track whose turn it is to place: 'white' or 'black'
-const currentPlacementColor = computed(() =>
-  placementMoveCount.value % 2 === 1 ? 'white' : 'black',
-);
+const currentPlacementColor = computed(() => {
+  const m = placementMoveCount.value;
+  // Odd moves: white, even moves: black
+  return m % 2 === 1 ? 'white' : 'black';
+});
+
+// Whether the current move must be a pawn (true) or a piece (false)
+const isCurrentMovePawnMove = computed(() => {
+  const m = placementMoveCount.value;
+  // Pattern: pawn, pawn, piece, piece, pawn, pawn, piece, piece, ...
+  const mod = (m - 1) % 4; // 0,1,2,3 repeating
+  return mod === 0 || mod === 1; // first two in each block of 4 are pawns
+});
 
 // Convenience: computed description of what is allowed this move
 const currentMoveRequirement = computed(() => {
@@ -62,8 +81,7 @@ const currentMoveRequirement = computed(() => {
     return 'Placement phase finished. Standard chess game has started.';
   }
   const colorText = currentPlacementColor.value === 'white' ? 'White' : 'Black';
-  const isPawnMove = placementMoveCount.value % 2 === 1;
-  if (isPawnMove) {
+  if (isCurrentMovePawnMove.value) {
     return `${colorText} must place a pawn.`;
   }
   return `${colorText} must place a piece (non-pawn).`;
@@ -197,12 +215,10 @@ function isMoveTypeLegalForTurn(pieceCode) {
   const isPawn = pieceCode === 'p';
   const isPiece = !isPawn;
 
-  const moveNumber = placementMoveCount.value;
-  const isOdd = moveNumber % 2 === 1;
+  const mustBePawn = isCurrentMovePawnMove.value;
 
-  // Odd moves must be pawn moves, even moves must be piece moves
-  if (isOdd && !isPawn) return false;
-  if (!isOdd && !isPiece) return false;
+  if (mustBePawn && !isPawn) return false;
+  if (!mustBePawn && !isPiece) return false;
   return true;
 }
 
@@ -474,6 +490,44 @@ function isPieceCountLegal(role, color) {
 }
 
 /**
+ * Compute the automatically recommended piece for the current move,
+ * following the priority:
+ *   knight -> bishop -> rook -> queen
+ * Only applies on "piece" moves (non-pawn). For pawn moves we always use pawn.
+ */
+function getRecommendedPieceForCurrentMove() {
+  if (!inPlacementPhase.value) return '';
+
+  const mustBePawn = isCurrentMovePawnMove.value;
+  const color = currentPlacementColor.value;
+
+  if (mustBePawn) {
+    // Always pawn on pawn moves
+    return 'p';
+  }
+
+  // Piece move: choose in order N, B, R, Q if there is remaining capacity
+  const priorities = ['n', 'b', 'r', 'q'];
+  const roleMap = {
+    n: 'knight',
+    b: 'bishop',
+    r: 'rook',
+    q: 'queen',
+  };
+
+  for (const code of priorities) {
+    const role = roleMap[code];
+    const check = isPieceCountLegal(role, color);
+    if (check === true || check.ok) {
+      return code;
+    }
+  }
+
+  // If nothing is available (should be rare), fall back to pawn so UI has something
+  return 'p';
+}
+
+/**
  * Convert our simple square->piece map into a full FEN string.
  * We always ensure there is at least one white king and one black king
  * by defaulting them to e1/e8 if missing.
@@ -655,7 +709,7 @@ function handleSquareSelect(square) {
   const expectedColor = currentPlacementColor.value; // 'white' or 'black'
   const expectedColorCode = expectedColor === 'white' ? 'w' : 'b';
 
-  // If user-selected color doesn't match, override it to avoid confusion
+  // Keep the dropdown in sync with the actual color to move
   selectedColor.value = expectedColorCode;
 
   // Do not allow placing on an occupied square
@@ -681,8 +735,7 @@ function handleSquareSelect(square) {
 
   // Enforce move type (pawn vs piece) alternation
   if (!isMoveTypeLegalForTurn(selectedPiece.value)) {
-    const isPawnMove = placementMoveCount.value % 2 === 1;
-    errorMessage.value = isPawnMove
+    errorMessage.value = isCurrentMovePawnMove.value
       ? 'This move must be a pawn placement.'
       : 'This move must be a piece (non-pawn) placement.';
     return;
@@ -764,10 +817,11 @@ function resetGame() {
   placementMoveCount.value = 1;
   inPlacementPhase.value = true;
   selectedPiece.value = '';
+  // Keep this in sync with currentPlacementColor (white on move 1)
   selectedColor.value = 'w';
   errorMessage.value = '';
   infoMessage.value =
-    'Placement phase: White starts by placing a pawn, then Black places a pawn, then White places a piece, then Black places a piece, and so on.';
+    'Placement phase: White pawn, Black pawn, White piece, Black piece, then repeat.';
 
   const fen = positionToFen(position);
   boardConfig.fen = fen;
@@ -782,6 +836,9 @@ function resetGame() {
 
   // Reset chess.js to this starting placement position
   chess.value = new Chess(fen);
+
+  // Auto-select recommended piece for the first move
+  selectedPiece.value = getRecommendedPieceForCurrentMove();
 }
 
 /**
@@ -798,7 +855,7 @@ function startChessGame() {
 
   inPlacementPhase.value = false;
   errorMessage.value = '';
-  infoMessage.value = 'Standard chess game started. White to move.';
+  infoMessage.value = 'Standard chess game started.';
 
   // For now we just freeze placement; full move integration can be added later.
   boardConfig.fen = fen;
@@ -811,6 +868,22 @@ function startChessGame() {
     boardApi.value.setPosition(fen);
   }
 }
+
+/**
+ * Automatically recommend a piece whenever the move number changes
+ * (i.e., after each successful placement) or when we re-enter placement phase.
+ * Also keep the displayed color in sync with the side to place.
+ * This does NOT prevent the user from manually changing the piece selection.
+ */
+watch(
+  () => placementMoveCount.value,
+  () => {
+    if (!inPlacementPhase.value) return;
+    selectedPiece.value = getRecommendedPieceForCurrentMove();
+    // Keep color dropdown in sync with the actual side to place
+    selectedColor.value = currentPlacementColor.value === 'white' ? 'w' : 'b';
+  },
+);
 </script>
 
 <template>
@@ -858,9 +931,9 @@ function startChessGame() {
           </select>
         </div>
 
-        <!-- Color selector is kept for visibility but effectively overridden by turn logic -->
+        <!-- Color selector shows whose turn it is; it is driven by the logic, not user choice -->
         <div class="controls-row">
-          <label class="control-label" for="color-select">Color (info only):</label>
+          <label class="control-label" for="color-select">Side to place:</label>
           <select
             id="color-select"
             v-model="selectedColor"
@@ -876,8 +949,14 @@ function startChessGame() {
           {{ currentMoveRequirement }}
         </p>
         <p class="hint">
-          1. Select a piece. 2. Click a legal square on the board to place that
-          piece. 3. Illegal placements are rejected with a message below.
+          A recommended piece is auto-selected for you (Knight → Bishop → Rook
+          → Queen on piece moves). You can still change the selection manually
+          before clicking a square.
+        </p>
+        <p class="hint">
+          1. Confirm or change the selected piece. 2. Click a legal square on
+          the board to place that piece. 3. Illegal placements are rejected
+          with a message below.
         </p>
         <p v-if="infoMessage" class="info">
           {{ infoMessage }}
